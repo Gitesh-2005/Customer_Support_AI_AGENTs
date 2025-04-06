@@ -7,3 +7,7 @@ groq==0.19.0
 python-jose==3.3.0
 aiofiles==23.2.1
 python-socketio==5.10.0
+streamlit-webrtc
+pyaudio==0.2.13
+streamlit==1.24.0
+streamlit-ace==0.2.0

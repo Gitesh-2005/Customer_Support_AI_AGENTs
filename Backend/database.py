@@ -7,102 +7,81 @@ DB_NAME = "tickets.db"
 def create_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    
+    # Create tickets table with all necessary columns
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             customer_name TEXT NOT NULL,
             issue_text TEXT NOT NULL,
             summary TEXT,
-            severity TEXT,
-            category TEXT,
-            key_points TEXT,
-            immediate_actions TEXT,
-            escalation_required BOOLEAN,
-            escalation_reason TEXT,
-            team_assignment TEXT,
-            follow_ups TEXT,
-            required_info TEXT,
-            resolution_steps TEXT,
-            alternative_solutions TEXT,
-            required_resources TEXT,
+            resolution TEXT,
             status TEXT DEFAULT 'Pending',
-            estimated_time TEXT,
+            ai_response TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # Add teams table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS teams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            specialty TEXT,
-            availability BOOLEAN DEFAULT true,
-            performance_score FLOAT DEFAULT 0
-        )
-    ''')
-
-    # Add agent performance table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS agent_performance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent_id TEXT NOT NULL,
-            tickets_resolved INTEGER DEFAULT 0,
-            avg_resolution_time REAL DEFAULT 0,
-            customer_satisfaction REAL DEFAULT 0,
-            efficiency_score REAL DEFAULT 0,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_name TEXT NOT NULL,
-            context TEXT,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS conversation_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id INTEGER,
-            message TEXT NOT NULL,
-            role TEXT NOT NULL,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-        )
-    ''')
-    
     conn.commit()
     conn.close()
 
-def insert_ticket(customer_name: str, issue_text: str):
+def insert_ticket(customer_name: str, issue_text: str, ai_response: dict = None):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO tickets (customer_name, issue_text) 
-        VALUES (?, ?)
-    ''', (customer_name, issue_text))
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute('''
+            INSERT INTO tickets (
+                customer_name, 
+                issue_text,
+                summary,
+                resolution,
+                status,
+                ai_response,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (
+            customer_name,
+            issue_text,
+            ai_response.get('summary', {}).get('text') if ai_response else None,
+            ai_response.get('recommendation', {}).get('solution') if ai_response else None,
+            'Pending',
+            json.dumps(ai_response) if ai_response else None
+        ))
+        conn.commit()
+        ticket_id = cursor.lastrowid
+        print(f"Inserted ticket {ticket_id}")  # Debug print
+        return ticket_id
+    except Exception as e:
+        print(f"Error inserting ticket: {e}")  # Debug print
+        raise
+    finally:
+        conn.close()
 
 def get_all_tickets():
     conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''SELECT 
-                id, 
-                customer_name, 
-                issue_text, 
-                summary, 
-                resolution, 
-                status, 
-                estimated_time 
-                FROM tickets''')
-    tickets = c.fetchall()
-    conn.close()
-    return tickets
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM tickets ORDER BY created_at DESC, id DESC
+        """)
+        columns = [description[0] for description in cursor.description]
+        tickets = cursor.fetchall()
+        result = []
+        for ticket in tickets:
+            ticket_dict = dict(zip(columns, ticket))
+            # Parse the AI response JSON if it exists
+            if ticket_dict.get('ai_response'):
+                try:
+                    ticket_dict['ai_response'] = json.loads(ticket_dict['ai_response'])
+                except json.JSONDecodeError:
+                    ticket_dict['ai_response'] = None
+            result.append(ticket_dict)
+        return result
+    except Exception as e:
+        print(f"Error fetching tickets: {e}")
+        return []
+    finally:
+        conn.close()
 
 def update_ticket(ticket_id: int, summary: Dict[str, Any], actions: Dict[str, Any], resolution: Dict[str, Any]):
     """Update ticket with detailed AI analysis results"""
@@ -208,13 +187,9 @@ def get_team_performance():
                 t.specialty,
                 t.availability,
                 t.performance_score,
-                COUNT(tk.id) AS total_tickets,
-                COALESCE(ROUND(AVG(
-                    CASE WHEN tk.status = 'Resolved' THEN 1 ELSE 0 END
-                ) * 100, 2), 0) AS resolution_rate
+                t.total_tickets,
+                t.resolution_rate
             FROM teams t
-            LEFT JOIN tickets tk ON tk.team_assignment = t.name
-            GROUP BY t.id
         ''')
         return cursor.fetchall()
     except sqlite3.Error as e:
@@ -230,25 +205,23 @@ def get_agent_metrics():
         cursor = conn.cursor()
         cursor.execute('''
             SELECT 
-                agent_id,
+                agent_name,
                 tickets_resolved,
                 avg_resolution_time,
-                customer_satisfaction,
-                efficiency_score
+                satisfaction_score
             FROM agent_performance
         ''')
         
         metrics = []
         for row in cursor.fetchall():
-            if len(row) != 5:
+            if len(row) != 4:
                 raise ValueError("Invalid column count in agent_performance")
                 
             metrics.append({
-                "agent_id": row[0],
+                "agent_name": row[0],
                 "tickets_resolved": row[1],
                 "avg_resolution_time": f"{row[2]:.1f} mins",
-                "satisfaction": row[3],
-                "efficiency": row[4]
+                "satisfaction_score": row[3]
             })
             
         return metrics

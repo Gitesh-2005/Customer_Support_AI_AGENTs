@@ -2,6 +2,8 @@
 import os
 import json
 import logging
+import io
+import wave
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +11,11 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import uvicorn
 import speech_recognition as sr
+from PIL import Image
+import pytesseract
+
+# Set the Tesseract command path explicitly (fallback if not in PATH)
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # Import your database functions and error handlers
 from database import create_db, insert_ticket, get_all_tickets, update_ticket, get_team_performance, get_agent_metrics, create_conversation, add_message_to_conversation
@@ -45,14 +52,35 @@ def read_root():
 
 def convert_voice_to_text(voice_bytes: bytes) -> str:
     recognizer = sr.Recognizer()
-    with sr.AudioFile(voice_bytes) as source:
-        audio = recognizer.record(source)
     try:
-        return recognizer.recognize_google(audio)
+        # Write the raw audio bytes to a WAV file
+        wav_audio = io.BytesIO()
+        with wave.open(wav_audio, "wb") as wav_file:
+            wav_file.setnchannels(1)  # Mono audio
+            wav_file.setsampwidth(2)  # 16-bit audio
+            wav_file.setframerate(16000)  # 16 kHz sample rate
+            wav_file.writeframes(voice_bytes)
+        wav_audio.seek(0)
+
+        with sr.AudioFile(wav_audio) as source:
+            audio_data = recognizer.record(source)
+        return recognizer.recognize_google(audio_data)
     except sr.UnknownValueError:
         return "Could not understand the audio."
     except sr.RequestError as e:
         return f"Speech recognition service error: {e}"
+    except Exception as e:
+        return f"Error processing audio: {e}"
+
+# Function to extract text from an image
+def extract_text_from_image(image_bytes: bytes) -> str:
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        extracted_text = pytesseract.image_to_string(image)
+        return extracted_text.strip()
+    except Exception as e:
+        logging.error(f"Error extracting text from image: {e}")
+        return ""
 
 @app.post("/submit_ticket/")
 async def submit_ticket(
@@ -67,40 +95,44 @@ async def submit_ticket(
             issue_text = convert_voice_to_text(voice_bytes)
         elif image:
             image_bytes = await image.read()
-            issue_text = handle_image(image_bytes)
+            issue_text = extract_text_from_image(image_bytes)
 
         if not issue_text:
             raise HTTPException(status_code=400, detail="No valid input provided")
 
-        # Save ticket to database
-        insert_ticket(customer_name, issue_text)
-        ai_response = handle_ticket(issue_text)
-
-        if safe_get(ai_response, "confidence", 0) >= 95:
-            return {"message": "Resolved instantly", "AI Response": ai_response}
+        # Process with AI and get response
+        ai_response = await handle_ticket(issue_text)
+        
+        # Store ticket in database with AI response
+        ticket_id = insert_ticket(customer_name, issue_text, ai_response)
+        
+        if safe_get(ai_response, "recommendation", {}).get("confidence", 0) >= 95:
+            return {"message": "Resolved instantly", "AI Response": ai_response, "ticket_id": ticket_id}
         else:
-            return {"message": "Ticket submitted for further review", "AI Response": ai_response}
+            return {"message": "Ticket submitted for further review", "AI Response": ai_response, "ticket_id": ticket_id}
     except Exception as e:
         logging.exception("Error in submit_ticket:")
         raise HTTPException(status_code=500, detail=f"Error submitting ticket: {str(e)}")
 
-@app.get("/get_tickets/")
+# Sort tickets by newest first and sync with user dashboard
+@app.get("/get_tickets/", response_model=List[dict])
 def get_tickets(query: Optional[str] = None):
     try:
         tickets = get_all_tickets()
         if query:
-            tickets = [t for t in tickets if query.lower() in t[2].lower()]
-        return {"tickets": [
-            {
-                "id": t[0],
-                "customer_name": t[1],
-                "issue_text": t[2],
-                "summary": t[3],
-                "resolution": t[4],
-                "status": t[5],
-                "estimated_time": t[6]
-            } for t in tickets
-        ]}
+            tickets = [t for t in tickets if query.lower() in t['issue_text'].lower()]
+        
+        # Ensure all required fields are present
+        return [{
+            "id": ticket['id'],
+            "customer_name": ticket['customer_name'],
+            "issue_text": ticket['issue_text'],
+            "summary": ticket['summary'],
+            "resolution": ticket['resolution'],
+            "status": ticket['status'],
+            "ai_response": ticket.get('ai_response'),
+            "created_at": ticket['created_at']
+        } for ticket in tickets]
     except Exception as e:
         logging.exception("Error in get_tickets:")
         raise HTTPException(status_code=500, detail=f"Error fetching tickets: {str(e)}")
@@ -171,8 +203,12 @@ def safe_get(data, key, default=None):
 async def get_admin_metrics():
     try:
         tickets = get_all_tickets()
+        resolved_tickets = len([t for t in tickets if t[5] == 'Resolved'])
+        unresolved_tickets = len(tickets) - resolved_tickets
+
         return {
-            "active_tickets": len([t for t in tickets if t[5] != 'Resolved']),
+            "active_tickets": unresolved_tickets,
+            "resolved_tickets": resolved_tickets,
             "timeline": ["Mon", "Tue", "Wed", "Thu", "Fri"],
             "resolution_rate": calculate_resolution_rate(tickets),
             "satisfaction": [4.2, 4.3, 4.4, 4.3, 4.5],
@@ -188,7 +224,8 @@ def calculate_resolution_rate(tickets):
     total = len(tickets) if tickets else 1
     return round((resolved / total) * 100, 2)
 
-@app.get("/admin/teams")
+# Fix Team Management tab
+@app.get("/admin/teams", response_model=List[dict])
 async def get_teams():
     try:
         teams = get_team_performance()
@@ -208,6 +245,7 @@ async def get_teams():
         logging.exception("Error fetching teams:")
         raise HTTPException(status_code=500, detail="Error fetching team data")
 
+# Fix Agent Metrics tab
 @app.get("/admin/agent-metrics", response_model=List[dict])
 def get_agent_metrics_endpoint():
     try:

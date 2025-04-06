@@ -86,44 +86,44 @@ class MultiAgentSystem:
         self.agents = {
             "summarizer": AIAgent(
                 "Summarization Agent",
-                prompt_template="""Analyze the customer support conversation and generate a concise summary in JSON format:
+                prompt_template="""Analyze the customer support conversation and generate a concise summary in JSON format.
+Check for specific issues like login problems, technical issues, or account-related problems before categorizing as a greeting.
+If the message contains any problem description, it should not be categorized as a greeting.
+
 {
-    "summary": "Brief summary of the issue",
+    "summary": "Brief description of the specific issue",
     "metadata": {
-        "sentiment": "Sentiment analysis result",
-        "priority": "Priority level",
-        "category": "Issue category",
-        "conversation_id": "Unique conversation ID"
+        "sentiment": "Analyze user sentiment (positive/negative/neutral)",
+        "priority": "Determine priority based on issue severity (high/medium/low)",
+        "category": "Categorize issue (login issue/technical/account/etc.)",
+        "conversation_id": "Generate unique ID"
     }
-}"""
-            ),
+}"""),
             "action_extractor": AIAgent(
                 "Action Extraction Agent",
-                prompt_template="""Identify all actionable tasks in the conversation and return them in JSON format:
+                prompt_template="""Identify specific actions needed to resolve the issue and return them in JSON format:
 {
     "actions": [
         {
-            "type": "Action type (e.g., Technical fix, Refund, Escalation)",
-            "description": "Specific steps required",
-            "priority": "Priority level (Critical/High/Medium)"
+            "type": "Action type (Authentication/Password Reset/Account Recovery/Technical Fix)",
+            "description": "Detailed steps to resolve the specific issue",
+            "priority": "Priority level (Critical/High/Medium/Low)"
         }
     ]
-}"""
-            ),
+}"""),
             "resolver": AIAgent(
                 "Resolution Recommendation Agent",
-                prompt_template="""Recommend solutions using past tickets and knowledge base articles. Return the result in JSON format:
+                prompt_template="""Recommend specific solutions based on the identified issue. Return the result in JSON format:
 {
     "recommendation": {
-        "solution": "Suggested fix",
+        "solution": "Specific solution to the identified problem",
         "confidence": "Confidence level",
-        "steps": ["step1", "step2"],
-        "resources": ["resource1"]
+        "steps": ["Step-by-step resolution steps"],
+        "resources": ["Relevant documentation/guides"]
     },
-    "similar_cases": ["List of similar ticket IDs"]
+    "similar_cases": ["Related ticket IDs"]
 }"""
             ),
-            # Additional agents omitted for brevity...
         }
 
     def extract_structured_data(self, text: str) -> Dict:
