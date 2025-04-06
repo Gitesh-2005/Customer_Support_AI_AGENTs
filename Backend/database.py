@@ -1,6 +1,6 @@
 import sqlite3
 import json
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 DB_NAME = "tickets.db"
 
@@ -48,9 +48,9 @@ def create_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agent_id TEXT NOT NULL,
             tickets_resolved INTEGER DEFAULT 0,
-            avg_resolution_time FLOAT DEFAULT 0,
-            customer_satisfaction FLOAT DEFAULT 0,
-            efficiency_score FLOAT DEFAULT 0,
+            avg_resolution_time REAL DEFAULT 0,
+            customer_satisfaction REAL DEFAULT 0,
+            efficiency_score REAL DEFAULT 0,
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -90,9 +90,17 @@ def insert_ticket(customer_name: str, issue_text: str):
 
 def get_all_tickets():
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM tickets')
-    tickets = cursor.fetchall()
+    c = conn.cursor()
+    c.execute('''SELECT 
+                id, 
+                customer_name, 
+                issue_text, 
+                summary, 
+                resolution, 
+                status, 
+                estimated_time 
+                FROM tickets''')
+    tickets = c.fetchall()
     conn.close()
     return tickets
 
@@ -188,35 +196,68 @@ def mark_ticket_resolved(ticket_id: int):
     finally:
         conn.close()
 
+
 def get_team_performance():
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
     try:
+        cursor = conn.cursor()
         cursor.execute('''
-            SELECT teams.id, teams.name, teams.specialty, teams.availability, teams.performance_score,
-                   COUNT(tickets.id) as total_tickets,
-                   ROUND(AVG(CASE WHEN tickets.status = 'Resolved' THEN 1 ELSE 0 END) * 100, 2) as resolution_rate
-            FROM teams
-            LEFT JOIN tickets ON tickets.team_assignment = teams.name
-            GROUP BY teams.id
+            SELECT 
+                t.id,
+                t.name,
+                t.specialty,
+                t.availability,
+                t.performance_score,
+                COUNT(tk.id) AS total_tickets,
+                COALESCE(ROUND(AVG(
+                    CASE WHEN tk.status = 'Resolved' THEN 1 ELSE 0 END
+                ) * 100, 2), 0) AS resolution_rate
+            FROM teams t
+            LEFT JOIN tickets tk ON tk.team_assignment = t.name
+            GROUP BY t.id
         ''')
-        results = cursor.fetchall()
-        return results
-    except Exception as e:
-        print(f"Error fetching team performance: {str(e)}")
-        raise
+        return cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"Database error: {str(e)}")
+        return []
     finally:
         conn.close()
 
 def get_agent_metrics():
+    """Retrieve agent performance metrics with validation"""
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
     try:
-        cursor.execute('SELECT * FROM agent_performance')
-        results = cursor.fetchall()
-        return results
-    except Exception as e:
-        print(f"Error fetching agent metrics: {str(e)}")
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 
+                agent_id,
+                tickets_resolved,
+                avg_resolution_time,
+                customer_satisfaction,
+                efficiency_score
+            FROM agent_performance
+        ''')
+        
+        metrics = []
+        for row in cursor.fetchall():
+            if len(row) != 5:
+                raise ValueError("Invalid column count in agent_performance")
+                
+            metrics.append({
+                "agent_id": row[0],
+                "tickets_resolved": row[1],
+                "avg_resolution_time": f"{row[2]:.1f} mins",
+                "satisfaction": row[3],
+                "efficiency": row[4]
+            })
+            
+        return metrics
+        
+    except sqlite3.Error as e:
+        print(f"Database error: {str(e)}")
+        raise
+    except ValueError as e:
+        print(f"Data validation error: {str(e)}")
         raise
     finally:
         conn.close()
@@ -255,3 +296,4 @@ def get_conversation_history(conversation_id: int, limit: int = 5):
     messages = cursor.fetchall()
     conn.close()
     return messages
+

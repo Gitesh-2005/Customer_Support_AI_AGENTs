@@ -1,40 +1,65 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from database import create_db, insert_ticket, get_all_tickets, update_ticket
-from ai_module import handle_ticket
-from typing import Optional
-import base64
-from database import create_conversation, add_message_to_conversation, get_conversation_history
-import json
-from dotenv import load_dotenv
+# main.py
 import os
+import json
+import logging
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+import uvicorn
+import speech_recognition as sr
+
+# Import your database functions and error handlers
+from database import create_db, insert_ticket, get_all_tickets, update_ticket, get_team_performance, get_agent_metrics, create_conversation, add_message_to_conversation
+from error_handling import handle_database_error, handle_index_error
+from ai_module import handle_ticket
 
 # Load environment variables
 load_dotenv()
 
+# Create the database if it doesn't exist
+create_db()
+
 app = FastAPI()
 
-# Add CORS middleware
+# CORS settings to allow your Streamlit frontend (adjust origin as needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Add your frontend URL
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-create_db()
+# Exception handlers
+app.add_exception_handler(IndexError, handle_index_error)
+app.add_exception_handler(Exception, lambda req, exc: JSONResponse(
+    status_code=500,
+    content={"message": "Unexpected error occurred", "details": str(exc)}
+))
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the AI Customer Support Backend"}
 
+def convert_voice_to_text(voice_bytes: bytes) -> str:
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(voice_bytes) as source:
+        audio = recognizer.record(source)
+    try:
+        return recognizer.recognize_google(audio)
+    except sr.UnknownValueError:
+        return "Could not understand the audio."
+    except sr.RequestError as e:
+        return f"Speech recognition service error: {e}"
+
 @app.post("/submit_ticket/")
 async def submit_ticket(
     customer_name: str = Form(...),
     issue_text: Optional[str] = Form(None),
-    voice: Optional[UploadFile] = None,
-    image: Optional[UploadFile] = None
+    voice: Optional[UploadFile] = File(None),
+    image: Optional[UploadFile] = File(None)
 ):
     try:
         if voice:
@@ -47,14 +72,16 @@ async def submit_ticket(
         if not issue_text:
             raise HTTPException(status_code=400, detail="No valid input provided")
 
+        # Save ticket to database
         insert_ticket(customer_name, issue_text)
         ai_response = handle_ticket(issue_text)
 
-        if ai_response.get("confidence", 0) >= 95:
+        if safe_get(ai_response, "confidence", 0) >= 95:
             return {"message": "Resolved instantly", "AI Response": ai_response}
         else:
             return {"message": "Ticket submitted for further review", "AI Response": ai_response}
     except Exception as e:
+        logging.exception("Error in submit_ticket:")
         raise HTTPException(status_code=500, detail=f"Error submitting ticket: {str(e)}")
 
 @app.get("/get_tickets/")
@@ -63,180 +90,106 @@ def get_tickets(query: Optional[str] = None):
         tickets = get_all_tickets()
         if query:
             tickets = [t for t in tickets if query.lower() in t[2].lower()]
-        return {"tickets": [{"id": t[0], "customer_name": t[1], "issue_text": t[2], "summary": t[3], "resolution": t[4], "status": t[5], "estimated_time": t[6]} for t in tickets]}
+        return {"tickets": [
+            {
+                "id": t[0],
+                "customer_name": t[1],
+                "issue_text": t[2],
+                "summary": t[3],
+                "resolution": t[4],
+                "status": t[5],
+                "estimated_time": t[6]
+            } for t in tickets
+        ]}
     except Exception as e:
+        logging.exception("Error in get_tickets:")
         raise HTTPException(status_code=500, detail=f"Error fetching tickets: {str(e)}")
 
 @app.post("/process_ticket/")
 def process_ticket(ticket_id: int, issue_text: str):
     try:
         ai_response = handle_ticket(issue_text)
-        update_ticket(ticket_id, ai_response["summary"], ai_response["resolution"], ai_response["estimated_time"])
+        update_ticket(ticket_id, ai_response.get("summary", ""), ai_response.get("recommendation", {}).get("solution", ""), ai_response.get("estimated_time", ""))
         return {"message": "Ticket processed successfully", "AI Response": ai_response}
     except Exception as e:
+        logging.exception("Error processing ticket:")
         raise HTTPException(status_code=500, detail=f"Error processing ticket: {str(e)}")
 
-@app.post("/proactive_prevention/")
-def proactive_prevention(
-    device_logs: Optional[str] = Form(None),
-    network_status: Optional[str] = Form(None),
-    software_status: Optional[str] = Form(None)
-):
-    try:
-        if not device_logs or not network_status or not software_status:
-            raise HTTPException(status_code=422, detail="Missing required fields")
-        prevention_tips = handle_prevention(device_logs, network_status, software_status)
-        return {"prevention_tips": prevention_tips}
-    except Exception as e:
-        print(f"Error in proactive prevention: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error in proactive prevention")
-
 @app.post("/chat/")
-async def handle_chat(
-    message: str = Form(None),
-    customer_name: str = Form(...),
-    conversation_id: Optional[int] = Form(None),
-    message_history: Optional[str] = Form(None),
-    image: Optional[UploadFile] = None,
-    voice: Optional[UploadFile] = None,
-    screenshot: Optional[str] = Form(None)
-):
+async def chat_endpoint(request: Request):
     try:
-        # Handle the predefined initial prompt when the chatbot is opened
-        if not message and not conversation_id:
-            message = "Hi I need help!"
-            response = "Welcome! 👋 How can I assist you today?"
-            conversation_id = create_conversation(customer_name)
-            add_message_to_conversation(conversation_id, message, "user")
-            add_message_to_conversation(conversation_id, response, "bot")
-            return {
-                "response": response,
-                "conversation_id": conversation_id
-            }
+        # Log the raw incoming request data
+        raw_body = await request.body()
+        logging.debug(f"Raw request body: {raw_body}")
 
-        if not conversation_id:
-            # Create a new conversation and ticket
-            conversation_id = create_conversation(customer_name)
-            insert_ticket(customer_name, message or "No initial message provided")
+        # Parse the JSON data
+        data = await request.json()
+        logging.debug(f"Parsed JSON data: {data}")
 
-        # Process message history for context
-        context = []
-        if message_history:
-            try:
-                history = json.loads(message_history)
-                context = [{"role": msg["type"], "content": msg["content"]} for msg in history]
-            except json.JSONDecodeError:
-                context = []
+        # Extract message and customer_name
+        message = data.get("message", "")
+        customer_name = data.get("customer_name", "")
 
-        response = ""
+        if not message or not customer_name:
+            logging.error("Missing required fields: message or customer_name")
+            return JSONResponse(content={"error": "Missing required fields"}, status_code=400)
 
-        if message:
-            # Add user message to conversation
-            add_message_to_conversation(conversation_id, message, "user")
+        # Process the message using AI agents
+        response = await handle_ticket(message)
+        logging.debug(f"AI Response: {response}")
 
-            # Get AI response with context
-            ai_response = handle_ticket(message, context=context)
-            print(f"AI Response: {ai_response}")  # Log the raw response for debugging
-            # Parse AI response
-            if isinstance(ai_response, dict) and "summary" in ai_response:
-                # Extract a concise one-liner response
-                response = ai_response["summary"] #.get("brief", "I'm sorry, I couldn't process your request.")
-                print(f"Parsed AI response: {response}")  # Log the parsed response
-                # Include task updates if available
-                if "actions" in ai_response and ai_response["actions"]:
-                    response += f" | Next Steps: {', '.join(action['description'] for action in ai_response['actions'])}"
-
-                # Include resolution if available
-                if "resolution" in ai_response and ai_response["resolution"]:
-                    response += f" | Resolution: {ai_response['resolution'][0].get('solution', 'No resolution provided')}"
-
-                # Store the full AI analysis in the database
-                add_message_to_conversation(conversation_id, json.dumps(ai_response), "analysis")
-            else:
-                # Log the issue for debugging
-                print(f"Unexpected AI response format: {ai_response}")
-                response = "I'm sorry, I couldn't process your request. Please try again."
-
-        elif image:
-            image_bytes = await image.read()
-            response = "Image received. Analyzing..."
-        elif voice:
-            voice_bytes = await voice.read()
-            text = convert_voice_to_text(voice_bytes)
-            response = f"Voice input received: {text}"
-        elif screenshot:
-            response = "Screenshot received. Analyzing..."
-        else:
-            raise HTTPException(status_code=400, detail="No valid input provided")
-
-        # Add AI response to the conversation
-        add_message_to_conversation(conversation_id, response, "bot")
-
-        return {
-            "response": response,
-            "conversation_id": conversation_id
-        }
+        return JSONResponse(content=response, status_code=200)
+    except json.JSONDecodeError as e:
+        logging.error(f"JSON decoding error: {e}")
+        return JSONResponse(content={"error": "Invalid JSON format"}, status_code=400)
     except Exception as e:
-        print(f"Chat endpoint error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing request: {str(e)}"
-        )
+        logging.exception("Error in /chat/ endpoint")
+        return JSONResponse(content={"error": "Internal server error", "details": str(e)}, status_code=500)
 
-def format_ai_response(ai_response: dict) -> str:
-    response = f"AI Analysis:\n"
-    if 'summary' in ai_response and isinstance(ai_response['summary'], dict):
-        response += f"Summary: {ai_response['summary'].get('brief', 'N/A')}\n"
-        response += f"Severity: {ai_response['summary'].get('severity', 'N/A')}\n"
-        
-    if 'actions' in ai_response and isinstance(ai_response['actions'], dict):
-        actions = ai_response['actions'].get('immediate_actions', [])
-        if actions:
-            response += "\nSuggested Actions:\n"
-            response += "\n".join(f"- {action}" for action in actions)
-            
-    if 'resolution' in ai_response:
-        response += f"\nEstimated Time: {ai_response['resolution'].get('total_estimated_time', 'Unknown')}"
-    return response
+def format_response(raw: dict) -> str:
+    parts = []
+    if raw.get("summary", {}).get("text"):
+        parts.append(f"📝 Summary: {raw['summary']['text']}")
+    if raw.get("actions"):
+        parts.append("🔧 Recommended Actions:")
+        parts.extend([f"- {a['description']}" for a in raw["actions"]])
+    if raw.get("recommendation", {}).get("solution"):
+        parts.append(f"✅ Solution: {raw['recommendation']['solution']} (Confidence: {raw['recommendation'].get('confidence', 0)}%)")
+    return "\n".join(parts) if parts else "I'm still learning how to help with that. Please try rephrasing."
 
-# Add these helper functions
 def handle_image(image_bytes: bytes) -> str:
-    # Placeholder for image processing
     return "I've received your image and I'm processing it."
 
-def convert_voice_to_text(voice_bytes: bytes) -> str:
-    # Placeholder for voice-to-text conversion
-    return "Voice input received."
-
-def handle_voice_input(text: str) -> str:
-    return f"I understood: {text}"
-
-def handle_screenshot(screenshot: str) -> str:
-    # Placeholder for screenshot processing
-    return "I've received your screenshot and I'm analyzing it."
-
-def handle_prevention(device_logs: str, network_status: str, software_status: str) -> str:
-    # Placeholder for proactive prevention logic
-    return "No issues detected. Your system is healthy."
+def safe_get(data, key, default=None):
+    if not data:
+        return default
+    if isinstance(data, dict):
+        return data.get(key, default)
+    return default
 
 @app.get("/admin/metrics")
 async def get_admin_metrics():
-    """Get performance metrics for admin dashboard"""
     try:
+        tickets = get_all_tickets()
         return {
-            "active_tickets": len([t for t in get_all_tickets() if t[5] != 'Resolved']),
-            "timeline": ["Mon", "Tue", "Wed", "Thu", "Fri"],  # Replace with actual dates
-            "resolution_rate": [85, 88, 87, 90, 92],  # Example data
-            "satisfaction": [4.2, 4.3, 4.4, 4.3, 4.5],  # Example data
+            "active_tickets": len([t for t in tickets if t[5] != 'Resolved']),
+            "timeline": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+            "resolution_rate": calculate_resolution_rate(tickets),
+            "satisfaction": [4.2, 4.3, 4.4, 4.3, 4.5],
             "overall_resolution_rate": 90,
             "avg_response_time": 15
         }
     except Exception as e:
+        logging.exception("Error in admin metrics:")
         raise HTTPException(status_code=500, detail=str(e))
+
+def calculate_resolution_rate(tickets):
+    resolved = len([t for t in tickets if t[4] == 'Resolved'])
+    total = len(tickets) if tickets else 1
+    return round((resolved / total) * 100, 2)
 
 @app.get("/admin/teams")
 async def get_teams():
-    """Get team information and performance"""
     try:
         teams = get_team_performance()
         return [
@@ -244,7 +197,7 @@ async def get_teams():
                 "id": team[0],
                 "name": team[1],
                 "specialty": team[2],
-                "availability": team[3],
+                "availability": bool(team[3]),
                 "performance_score": team[4],
                 "total_tickets": team[5],
                 "resolution_rate": team[6]
@@ -252,43 +205,50 @@ async def get_teams():
             for team in teams
         ]
     except Exception as e:
-        print(f"Error fetching teams: {str(e)}")
+        logging.exception("Error fetching teams:")
         raise HTTPException(status_code=500, detail="Error fetching team data")
 
-@app.get("/admin/agent-metrics")
-def get_agent_metrics():
-    """Get agent performance metrics"""
+@app.get("/admin/agent-metrics", response_model=List[dict])
+def get_agent_metrics_endpoint():
     try:
-        metrics = get_agent_metrics()  # Ensure this is called synchronously
-        return [
-            {
-                "agent_id": metric[1],
-                "tickets_resolved": metric[2],
-                "avg_resolution_time": metric[3],
-                "customer_satisfaction": metric[4],
-                "efficiency_score": metric[5]
-            }
-            for metric in metrics
-        ]
+        metrics = get_agent_metrics()
+        return metrics if metrics else []
     except Exception as e:
-        print(f"Error fetching agent metrics: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error fetching agent metrics")
+        logging.exception("Error fetching agent metrics:")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve metrics: {str(e)}")
 
 @app.get("/suggestions")
 def get_suggestions():
-    """Provide suggestions based on database data"""
     try:
         tickets = get_all_tickets()
-        suggestions = []
-        for ticket in tickets:
-            if ticket[5] == "Pending":
-                suggestions.append({
-                    "ticket_id": ticket[0],
-                    "customer_name": ticket[1],
-                    "issue_text": ticket[2],
-                    "suggested_action": "Assign to team" if not ticket[15] else "Follow up"
-                })
-        return {"suggestions": suggestions}
+        return {
+            "suggestions": [
+                {
+                    "ticket_id": t[0],
+                    "customer_name": t[1],
+                    "suggestion": generate_suggestion(t)
+                }
+                for t in tickets if t[4] == 'Pending'
+            ]
+        }
     except Exception as e:
-        print(f"Error fetching suggestions: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error fetching suggestions")
+        logging.exception("Suggestions error:")
+        raise HTTPException(status_code=500, detail="Error generating suggestions")
+    except IndexError:
+        raise HTTPException(status_code=500, detail="Data format mismatch in tickets")
+
+def generate_suggestion(ticket):
+    if "technical" in ticket[2].lower():
+        return "Escalate to technical team"
+    return "Assign to general support"
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logging.exception("Unhandled error:")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal Server Error", "message": str(exc)}
+    )
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

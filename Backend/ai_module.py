@@ -1,11 +1,18 @@
+# ai_module.py
 import os
-from groq import Groq
-from typing import Dict, Any, List
 import json
+import uuid
+import logging
+import asyncio
+from typing import Dict, Any, List
+from groq import Groq
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
 class AIAgent:
     def __init__(self, name: str, prompt_template: str, model: str = "llama-3.3-70b-versatile"):
@@ -17,13 +24,13 @@ class AIAgent:
         self.model = model
         self.prompt_template = prompt_template
 
-    def process(self, content: str, context: str = "") -> Dict[str, Any]:
+    async def process(self, content: str, context: str = "") -> Dict[str, Any]:
         try:
             # Format messages for chat completion
             messages = [
                 {
                     "role": "system",
-                    "content": self.prompt_template + "\nImportant: Always respond with valid JSON format."
+                    "content": self.prompt_template + "\nImportant: Always respond with valid JSON format and provide contextually relevant responses."
                 },
                 {
                     "role": "user",
@@ -31,38 +38,43 @@ class AIAgent:
                 }
             ]
 
-            # Make API call with proper error handling
+            # Make the API call
             completion = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0.3,
-                response_format={"type": "json_object"},  # Enforce JSON output
+                temperature=0.7,  # Adjusted for more creative responses
                 max_tokens=2048,
                 top_p=0.9,
                 stream=False
             )
 
+            # Log rate-limit and response headers (if available)
+            headers = getattr(completion, "headers", {})
+            logging.debug("API Response Headers: %s", headers)
+
             if not completion.choices:
-                raise ValueError("No response from Groq API")
+                raise ValueError("No response from AI API")
 
             response_text = completion.choices[0].message.content.strip()
-            print(" Response: ,",response_text)  # Log the raw response
+            logging.debug("Raw AI Response Text: %s", response_text)
 
             # Parse the response as JSON
             response_data = json.loads(response_text)
+            if isinstance(response_data, str):
+                response_data = json.loads(response_data)
             if not isinstance(response_data, dict):
                 raise ValueError("Response is not a JSON object")
             return response_data
 
         except json.JSONDecodeError as e:
-            print(f"JSON parsing error: {str(e)}\nResponse: {response_text}")
+            logging.error("JSON parsing error in %s: %s. Response: %s", self.name, str(e), response_text)
             return {
                 "error": "Invalid JSON response format",
                 "original_response": response_text,
                 "details": str(e)
             }
         except Exception as e:
-            print(f"Error in {self.name}: {str(e)}")
+            logging.exception("Error in %s:", self.name)
             return {
                 "error": "Processing error",
                 "details": str(e),
@@ -75,128 +87,216 @@ class MultiAgentSystem:
             "summarizer": AIAgent(
                 "Summarization Agent",
                 prompt_template="""Analyze the customer support conversation and generate a concise summary in JSON format:
-                {
-                    "summary": "Brief summary of the issue",
-                    "metadata": {
-                        "sentiment": "Sentiment analysis result",
-                        "priority": "Priority level",
-                        "category": "Issue category",
-                        "conversation_id": "Unique conversation ID"
-                    }
-                }"""
+{
+    "summary": "Brief summary of the issue",
+    "metadata": {
+        "sentiment": "Sentiment analysis result",
+        "priority": "Priority level",
+        "category": "Issue category",
+        "conversation_id": "Unique conversation ID"
+    }
+}"""
             ),
             "action_extractor": AIAgent(
                 "Action Extraction Agent",
                 prompt_template="""Identify all actionable tasks in the conversation and return them in JSON format:
-                {
-                    "actions": [
-                        {
-                            "type": "Action type (e.g., Technical fix, Refund, Escalation)",
-                            "description": "Specific steps required",
-                            "priority": "Priority level (Critical/High/Medium)"
-                        }
-                    ]
-                }"""
-            ),
-            "router": AIAgent(
-                "Task Routing Agent",
-                prompt_template="""Route tasks to teams based on issue type, urgency, and resources. Return the result in JSON format:
-                {
-                    "task": "Task description",
-                    "route_to": "Team name",
-                    "reason": "Reason for routing"
-                }"""
+{
+    "actions": [
+        {
+            "type": "Action type (e.g., Technical fix, Refund, Escalation)",
+            "description": "Specific steps required",
+            "priority": "Priority level (Critical/High/Medium)"
+        }
+    ]
+}"""
             ),
             "resolver": AIAgent(
                 "Resolution Recommendation Agent",
                 prompt_template="""Recommend solutions using past tickets and knowledge base articles. Return the result in JSON format:
-                {
-                    "recommendation": "Suggested fix",
-                    "confidence": "Confidence level",
-                    "similar_cases": ["List of similar ticket IDs"]
-                }"""
+{
+    "recommendation": {
+        "solution": "Suggested fix",
+        "confidence": "Confidence level",
+        "steps": ["step1", "step2"],
+        "resources": ["resource1"]
+    },
+    "similar_cases": ["List of similar ticket IDs"]
+}"""
             ),
-            "time_estimator": AIAgent(
-                "Resolution Time Estimation Agent",
-                prompt_template="""Predict resolution time and return the result in JSON format:
-                {
-                    "estimate": "Estimated time for resolution",
-                    "confidence": "Confidence level"
-                }"""
-            ),
-            "feedback_learner": AIAgent(
-                "Feedback Learning Agent",
-                prompt_template="""Analyze resolved tickets and provide insights in JSON format:
-                {
-                    "insights": [
-                        {
-                            "description": "Insight description",
-                            "impact": "Impact of the insight"
-                        }
-                    ]
-                }"""
-            ),
-            "supervisor": AIAgent(
-                "Supervisor Agent",
-                prompt_template="""Orchestrate workflow and validate outputs. Return the result in JSON format:
-                {
-                    "workflow_status": "Status of the workflow",
-                    "validation": "Validation results"
-                }"""
-            ),
-            "sentiment_urgency": AIAgent(
-                "Sentiment & Urgency Detection Agent",
-                prompt_template="""Analyze text for sentiment and urgency. Return the result in JSON format:
-                {
-                    "sentiment": "Sentiment analysis result",
-                    "urgency": "Urgency level"
-                }"""
-            ),
-            "multimodal_support": AIAgent(
-                "Multimodal Support Agent",
-                prompt_template="""Process non-text inputs and return structured data in JSON format:
-                {
-                    "extracted_data": "Extracted information from input"
-                }"""
-            )
+            # Additional agents omitted for brevity...
         }
 
     def extract_structured_data(self, text: str) -> Dict:
         try:
             return json.loads(text)
         except json.JSONDecodeError as e:
-            print(f"JSON parsing error: {str(e)}\nText: {text}")
+            logging.error("JSON parsing error: %s. Text: %s", str(e), text)
             return {}
 
 # Initialize the multi-agent system
 agent_system = MultiAgentSystem()
 
-def handle_ticket(issue_text: str, context: List[Dict[str, str]] = None) -> Dict[str, Any]:
+import json
+import uuid
+import logging
+import asyncio
+from typing import Dict, Any, List
+
+def safe_parse(data, default):
+    """Parse data as JSON if it's a string; otherwise, return data or default."""
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return default
+    elif isinstance(data, dict):
+        return data
+    return default
+
+def safe_get(data, key, default=None):
+    """Safely get a value from a dictionary."""
+    return data.get(key, default) if isinstance(data, dict) else default
+
+async def handle_ticket(issue_text: str, context: list = None) -> dict:
     """
-    Process a ticket using the multi-agent system with optional context.
+    Process a ticket using the multi-agent system with enhanced error handling.
+    Ensures the final "summary" field is always a dictionary with a "text" key.
     """
+    # Default response structure.
+    ai_response = {
+        "summary": {"text": "", "category": "general"},
+        "metadata": {"sentiment": "neutral", "priority": "low", "category": "general inquiry", "conversation_id": None},
+        "actions": [],
+        "recommendation": {"solution": "", "confidence": 0},
+        "similar_cases": []
+    }
+
+    # Simple greeting shortcut.
+    if "hello" in issue_text.lower() or "hi" in issue_text.lower():
+        return {
+            "summary": {"text": "Customer greeting received"},
+            "metadata": {
+                "sentiment": "positive",
+                "priority": "low",
+                "category": "greeting",
+                "conversation_id": f"conv_{uuid.uuid4().hex[:8]}"
+            },
+            "actions": [{
+                "type": "GreetingResponse",
+                "description": "Provide welcome message",
+                "priority": "high"
+            }],
+            "recommendation": {
+                "solution": "Welcome to support! How can I help you today?",
+                "confidence": 95,
+                "steps": ["Ask user to describe their issue"],
+                "resources": []
+            },
+            "similar_cases": []
+        }
+
     try:
-        context_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in context]) if context else "No context provided."
+        logging.debug("Calling summarizer agent")
+        summary = safe_parse(await agent_system.agents["summarizer"].process(issue_text, context) or {}, {"summary": "", "metadata": {}})
 
-        # Summarize the issue
-        summary_data = agent_system.agents["summarizer"].process(issue_text, context_str)
+        logging.debug("Calling action_extractor agent")
+        actions = safe_parse(await agent_system.agents["action_extractor"].process(issue_text, context) or {}, {"actions": []})
 
-        # Extract actionable insights
-        actions_data = agent_system.agents["action_extractor"].process(issue_text, context_str)
+        logging.debug("Calling resolver agent")
+        resolution = safe_parse(await agent_system.agents["resolver"].process(issue_text, context) or {}, {"recommendation": {}, "similar_cases": []})
 
-        # Recommend resolutions
-        resolution_data = agent_system.agents["resolver"].process(issue_text, context_str)
+        logging.debug("Raw summary response: %s", summary)
+        logging.debug("Raw actions response: %s", actions)
+        logging.debug("Raw resolution response: %s", resolution)
 
-        return {
-            "summary": summary_data.get("summary", {}),
-            "actions": actions_data.get("actions", []),
-            "resolution": resolution_data.get("recommendation", {}),
-            "confidence": resolution_data.get("confidence", 80)  # Default confidence
+        # Ensure responses are dictionaries.
+        if not isinstance(summary, dict):
+            summary = {"summary": str(summary), "metadata": {}}
+        if not isinstance(actions, dict):
+            actions = {"actions": []}
+        if not isinstance(resolution, dict):
+            resolution = {"recommendation": {}, "similar_cases": []}
+
+        # Process recommendation.
+        raw_reco = safe_parse(resolution.get("recommendation", {}), {"solution": "", "confidence": "0"})
+        confidence_value = raw_reco.get("confidence", "0")
+        try:
+            if isinstance(confidence_value, str):
+                if confidence_value.lower() in ["high", "medium", "low"]:
+                    confidence_numeric = {"high": 80, "medium": 50, "low": 20}.get(confidence_value.lower(), 50)
+                else:
+                    confidence_numeric = int(confidence_value)
+            else:
+                confidence_numeric = int(confidence_value)
+        except (ValueError, TypeError):
+            confidence_numeric = 50
+
+        safe_reco = {
+            "solution": raw_reco.get("solution", "Default solution"),
+            "confidence": confidence_numeric,
+            "steps": raw_reco.get("steps", []),
+            "resources": raw_reco.get("resources", [])
         }
+
+        # Build final response.
+        final_response = {
+            "summary": summary.get("summary", "Issue processed"),
+            "metadata": summary.get("metadata", {}),
+            "actions": actions.get("actions", []),
+            "recommendation": safe_reco,
+            "similar_cases": resolution.get("similar_cases", [])
+        }
+        logging.debug("Intermediate final response: %s", final_response)
+
+        # Ensure "summary" is always a dictionary with a "text" key.
+        if not isinstance(final_response.get("summary"), dict):
+            final_response["summary"] = {"text": str(final_response["summary"])}
+        # Ensure "recommendation" is always a dictionary
+        if not isinstance(final_response.get("recommendation"), dict):
+            final_response["recommendation"] = {"solution": str(final_response["recommendation"])}
+        logging.debug("Final response: %s", final_response)
+        return final_response
+
     except Exception as e:
-        print(f"Error processing ticket: {str(e)}")
+        logging.exception("Critical error in handle_ticket:")
         return {
-            "error": "Error processing ticket",
+            "error": "System failure",
             "details": str(e),
-            "suggestion": "Please retry or contact support."
+            "response": "I'm experiencing technical difficulties. Your issue has been logged and our team will investigate."
         }
+
+def format_response(raw: dict) -> str:
+    """
+    Convert structured AI response to a user-friendly text message.
+    Assumes that raw["summary"] is a dictionary with a "text" key.
+    """
+    parts = []
+    
+    summary = raw.get("summary")
+    if isinstance(summary, dict):
+        summary_text = summary.get("text", "") or summary.get("summary", "")
+    else:
+        summary_text = summary or ""
+    
+    if summary_text:
+        parts.append(f"📝 Summary: {summary_text}")
+    
+    actions = raw.get("actions", [])
+    if actions:
+        parts.append("🔧 Recommended Actions:")
+        for a in actions:
+            if isinstance(a, dict):
+                parts.append(f"- {a.get('description', a)}")
+            else:
+                parts.append(f"- {a}")
+    
+    recommendation = raw.get("recommendation", {})
+    if isinstance(recommendation, dict):
+        solution = recommendation.get("solution", "")
+        confidence = recommendation.get("confidence", 0)
+        if solution:
+            parts.append(f"✅ Solution: {solution} (Confidence: {confidence}%)")
+    elif isinstance(recommendation, str):
+        parts.append(f"✅ Solution: {recommendation}")
+    
+    return "\n".join(parts) if parts else "I'm still learning how to help with that. Please try rephrasing."

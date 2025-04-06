@@ -1,11 +1,22 @@
 import { BaseAgent } from './baseAgent';
 import { SupportTicket, SummarizationAgent as ISummarizationAgent } from '../types/ai';
+import { logger } from '../utils/logger';
 
 export class SummarizationAgent extends BaseAgent implements ISummarizationAgent {
+  private prompt_template = `Analyze the customer support conversation and generate a concise summary in JSON format:
+  {
+      "summary": "Brief summary of the issue",
+      "metadata": {
+          "sentiment": "Sentiment analysis result",
+          "priority": "Priority level",
+          "category": "Issue category (e.g., technical issue, account issue, payment issue)",
+          "conversation_id": "Unique conversation ID"
+      }
+  }
+  Focus on identifying the main issue described by the user. Avoid categorizing as a greeting unless explicitly stated.`;
+
   async process(ticket: SupportTicket): Promise<string> {
-    const prompt = `Summarize the following support ticket in a clear and concise way. 
-    Focus on the main issue, any relevant context, and the current status.
-    Format the summary in a way that would be helpful for a support agent to quickly understand the situation.
+    const prompt = `${this.prompt_template}
     
     Ticket Title: ${ticket.title}
     Description: ${ticket.description}
@@ -16,10 +27,10 @@ export class SummarizationAgent extends BaseAgent implements ISummarizationAgent
 
     try {
       const summary = await this.callOpenAI(prompt);
-      return summary;
+      return summary || "No summary available.";
     } catch (error) {
       logger.error('Failed to generate summary:', error);
-      throw error;
+      return "Error generating summary.";
     }
   }
 
@@ -58,4 +69,4 @@ export class SummarizationAgent extends BaseAgent implements ISummarizationAgent
       return [];
     }
   }
-} 
+}
